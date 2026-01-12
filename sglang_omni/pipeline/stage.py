@@ -5,19 +5,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import pickle
 from typing import Any, Callable
 
+import numpy as np
+
+from sglang_omni.pipeline.input_handler import DirectInput, InputHandler
+from sglang_omni.pipeline.worker import Worker
 from sglang_omni.core.types import (
     DataReadyMessage,
     ShutdownMessage,
     StageInfo,
     SubmitMessage,
 )
-from sglang_omni.pipeline.input_handler import DirectInput, InputHandler
-from sglang_omni.pipeline.worker import Worker
-from sglang_omni.relay import SHMRelay
-from sglang_omni.relay.relays.base import Relay
 from sglang_omni.transport.control_plane import StageControlPlane
+from sglang_omni.relay.relays.base import Relay
+from sglang_omni.relay.relays.nixl import NIXLRelay
+from sglang_omni.relay.relays.shm import SHMRelay
+from sglang_omni.relay.nixl import RdmaMetadata
+from sglang_omni.relay.descriptor import Descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ class Stage:
         endpoints: dict[str, str],
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
+        relay_config: dict[str, Any] | None = None,
     ):
         """Initialize a stage.
 
@@ -59,7 +66,8 @@ class Stage:
             abort_endpoint: ZMQ endpoint for abort broadcasts
             endpoints: Dict of stage_name -> endpoint for routing
             input_handler: Input handler for aggregation (default: DirectInput)
-            relay: Relay implementation for data transfer (default: SHMRelay)
+            relay: Relay instance for data transfer (default: NIXLRelay if config provided, else SHMRelay)
+            relay_config: Configuration dict for NIXLRelay (if relay is None)
         """
         self.name = name
         self.get_next = get_next
@@ -67,7 +75,12 @@ class Stage:
         self.input_handler = input_handler or DirectInput()
 
         # Components
-        self.relay = relay or SHMRelay()
+        # Initialize relay: use provided relay, or create NIXLRelay if config provided, else SHMRelay
+        if relay_config is not None:
+            self.relay = NIXLRelay(relay_config)
+        else:
+            self.relay = SHMRelay()
+        
         self.control_plane = StageControlPlane(
             stage_name=name,
             recv_endpoint=recv_endpoint,
@@ -200,21 +213,52 @@ class Stage:
             self.relay.cleanup(request_id)
             return
 
-        # Read data using unified relay interface
+        # Read data using relay interface
         try:
-            # Use empty descriptor list - SHMRelay will return data in the operation object
-            read_op = self.relay.get(metadata=msg.shm_metadata, descriptors=[])
-            await read_op.wait_for_completion()
+            # Determine relay type and prepare descriptors accordingly
+            if isinstance(self.relay, SHMRelay):
+                # SHMRelay: descriptors can be empty, data is in read_op.data
+                read_op = await self.relay.get_async(metadata=msg.shm_metadata, descriptors=[])
+                await read_op.wait_for_completion()
+                data = read_op.data
+            else:
+                # NIXLRelay: need to create descriptors from metadata
+                # Extract remote descriptors from metadata
+                remote_descriptors = msg.shm_metadata.to_descriptors()
+                
+                # Create local descriptors (buffers) to receive data
+                # Handle both single Descriptor and list[Descriptor] cases
+                if isinstance(remote_descriptors, list):
+                    # Multiple descriptors - create buffers for each
+                    local_descriptors = []
+                    for remote_desc in remote_descriptors:
+                        # Create a buffer of the same size
+                        buffer = np.empty(remote_desc.size, dtype=np.uint8)
+                        local_desc = Descriptor((buffer.ctypes.data, remote_desc.size, "cpu", buffer))
+                        local_descriptors.append(local_desc)
+                else:
+                    # Single descriptor
+                    buffer = np.empty(remote_descriptors.size, dtype=np.uint8)
+                    local_desc = Descriptor((buffer.ctypes.data, remote_descriptors.size, "cpu", buffer))
+                    local_descriptors = [local_desc]
 
-            # Get data from the operation object
-            data = read_op.data
-
-            logger.debug(
-                "Stage %s received data from %s for req=%s",
-                self.name,
-                msg.from_stage,
-                request_id,
-            )
+                
+                read_op = await self.relay.get_async(metadata=msg.shm_metadata, descriptors=local_descriptors)
+                await read_op.wait_for_completion()
+                
+                # Extract data from buffer(s)
+                # For simple Python objects, data should be in the first buffer
+                if len(local_descriptors) > 0:
+                    buffer = local_descriptors[0]._data_ref
+                    # Deserialize the data (assuming it was pickled)
+                    data = pickle.loads(buffer.tobytes())
+                else:
+                    logger.error(
+                        "Stage %s: no descriptors to extract data from for req=%s",
+                        self.name,
+                        request_id,
+                    )
+                    return
         except Exception as e:
             logger.error(
                 "Stage %s failed to get data for req=%s: %s", self.name, request_id, e
